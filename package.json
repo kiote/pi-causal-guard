@@ -1,0 +1,24 @@
+{
+  "name": "pi-causal-guard",
+  "version": "0.1.0",
+  "description": "Pi package: on each question, find the domain, gather repository and session context, use or create a causal model, check causal claims, and record model updates.",
+  "license": "MIT",
+  "private": false,
+  "author": "kiote",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kiote/pi-causal-guard.git"
+  },
+  "homepage": "https://github.com/kiote/pi-causal-guard#readme",
+  "keywords": ["pi-package"],
+  "files": ["extensions", "bin", "README.md", "LICENSE", "CHANGELOG.md", "SPEC.md"],
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": [],
+    "prompts": []
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
