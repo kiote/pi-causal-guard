@@ -408,3 +408,231 @@ def test_store_is_created_with_git_and_only_the_general_domain(cli, store):
 def test_usage_error_is_one_json_object(cli):
     code, out = cli("save")
     assert code == 2 and out["error"].startswith("usage:")
+
+
+# ---------------------------------------------------------------- v0.2.0: variable roles (AC5)
+
+SPEC_ROLES = ("exposure", "outcome", "mediator", "context", "selection", "measurement", "latent", "other")
+
+
+def test_each_listed_role_and_missing_role_pass():
+    for role in SPEC_ROLES:
+        model = make_model([("X", "Y")])
+        model["variables"][0]["role"] = role
+        assert causal_store.validate_model(model) == [], role
+    assert "role" not in make_model([("X", "Y")])["variables"][0]
+    assert causal_store.validate_model(make_model([("X", "Y")])) == []
+
+
+def test_unlisted_role_fails():
+    model = make_model([("X", "Y")])
+    model["variables"][0]["role"] = "confounder"
+    errors = causal_store.validate_model(model)
+    assert errors == ["variable X role must be one of " + ", ".join(SPEC_ROLES)]
+
+
+def test_update_with_unlisted_role_is_rejected_and_changes_nothing(cli, store):
+    assert save(cli, make_model([("X", "Y")]))[0] == 0
+    before = (store / "models" / "m.yaml").read_text(encoding="utf-8")
+    commits = commit_count(store)
+    code, out = cli("update", "--model", "m", stdin={
+        "facts": [{"text": "Z exists", "source": "s1"}],
+        "add_variables": [{"id": "Z", "label": "Z", "definition": "variable Z", "role": "instrument"}]})
+    assert code == 2 and any(e.startswith("variable Z role must be one of") for e in out["errors"]), out
+    assert (store / "models" / "m.yaml").read_text(encoding="utf-8") == before
+    assert commit_count(store) == commits
+    assert not (store / "log.jsonl").exists()
+
+
+# ---------------------------------------------------------------- v0.2.0: edge types (AC6)
+
+def bidirected(a, b, edge_id=None, status="assumed"):
+    return {"id": edge_id or f"{a}_bi_{b}", "from": a, "to": b, "type": "bidirected", "status": status,
+            "reason": f"unmeasured common cause of {a} and {b}", "sources": ["s1"]}
+
+
+def test_missing_edge_type_is_directed():
+    model = make_model([("X", "Y")])
+    assert "type" not in model["edges"][0]
+    model["edges"].append(dict(model["edges"][0], id="X_Y_typed", type="directed"))
+    errors = causal_store.validate_model(model)
+    assert errors == ["duplicate edge X->Y (X_Y_typed)"]
+    loop = make_model([("X", "Y")])
+    loop["edges"].append(dict(loop["edges"][0], id="Y_X", **{"from": "Y", "to": "X"}))
+    assert any(e.startswith("directed cycle:") for e in causal_store.validate_model(loop))
+
+
+def test_unknown_edge_type_fails():
+    model = make_model([("X", "Y")])
+    model["edges"][0]["type"] = "undirected"
+    assert causal_store.validate_model(model) == ["edge X_Y type must be one of directed, bidirected"]
+
+
+def test_bidirected_self_edge_fails():
+    model = make_model([("X", "Y")])
+    model["edges"].append(bidirected("X", "X"))
+    assert causal_store.validate_model(model) == ["edge X_bi_X goes from X to itself"]
+
+
+def test_two_bidirected_edges_on_one_pair_fail_in_either_order():
+    for second in (bidirected("X", "Y", "b2"), bidirected("Y", "X", "b2")):
+        model = make_model([("X", "Y")])
+        model["edges"] += [bidirected("X", "Y", "b1"), second]
+        errors = causal_store.validate_model(model)
+        assert errors == [f"duplicate bidirected edge {second['from']}<->{second['to']} (b2)"], errors
+
+
+def test_directed_and_bidirected_edge_on_one_pair_pass():
+    model = make_model([("X", "Y")])
+    model["edges"].append(bidirected("X", "Y"))
+    assert causal_store.validate_model(model) == []
+
+
+def test_bidirected_edge_is_not_part_of_the_cycle_test():
+    model = make_model([("B", "A")])
+    model["edges"].append(bidirected("A", "B"))
+    assert causal_store.validate_model(model) == []
+    cyclic = make_model([("A", "B"), ("B", "C"), ("C", "A")])
+    cyclic["edges"].append(bidirected("A", "C"))
+    assert any(e.startswith("directed cycle:") for e in causal_store.validate_model(cyclic))
+
+
+# ---------------------------------------------------------------- v0.2.0: checks with bidirected edges (AC7)
+
+def with_bidirected(edges, bidirected_pairs, **kwargs):
+    names = sorted({n for pair in [*edges, *bidirected_pairs] for n in pair})
+    model = make_model(edges, variables=names, **kwargs)
+    model["edges"] += [bidirected(a, b) for a, b in bidirected_pairs]
+    assert causal_store.validate_model(model) == []
+    return model
+
+
+def test_bidirected_confounding_observational_does_not_follow():
+    model = with_bidirected([("X", "Y")], [("X", "Y")])
+    result = verdict(model, make_claim("X", "Y", [["X", "Y"]]))
+    assert result["verdict"] == "does_not_follow"
+    assert result["problems"] == ["open backdoor path given nothing: X <-> Y"]
+    assert result["notes"] == [] and result["risky_edges"] == [{"id": "X_Y", "from": "X", "to": "Y", "status": "assumed"}]
+
+
+def test_bidirected_confounding_randomized_follows():
+    model = with_bidirected([("X", "Y")], [("X", "Y")])
+    result = verdict(model, make_claim("X", "Y", [["X", "Y"]], design="randomized"))
+    assert result["verdict"] == "follows" and result["problems"] == [] and result["notes"] == []
+
+
+def test_front_door_claim_with_bidirected_confounding_does_not_follow():
+    model = with_bidirected([("X", "M"), ("M", "Y")], [("X", "Y")])
+    result = verdict(model, make_claim("X", "Y", [["X", "M", "Y"]]))
+    assert result["verdict"] == "does_not_follow"
+    assert result["problems"] == ["open backdoor path given nothing: X <-> Y"]
+
+
+def test_bidirected_backdoor_blocked_by_conditioning_follows():
+    model = with_bidirected([("X", "Y"), ("Z", "Y")], [("X", "Z")])
+    result = verdict(model, make_claim("X", "Y", [["X", "Y"]], conditioned_on=["Z"]))
+    assert result["verdict"] == "follows" and result["problems"] == [] and result["notes"] == []
+    open_result = verdict(model, make_claim("X", "Y", [["X", "Y"]]))
+    assert open_result["problems"] == ["open backdoor path given nothing: X <-> Z -> Y"]
+
+
+def test_claimed_path_over_bidirected_edge_does_not_follow():
+    model = with_bidirected([("M", "Y")], [("X", "M")])
+    result = verdict(model, make_claim("X", "Y", [["X", "M", "Y"]], design="randomized"))
+    assert result["verdict"] == "does_not_follow"
+    assert result["problems"] == ["claimed path X->M->Y is not a directed path from X to Y in the model"]
+    assert result["risky_edges"] == [{"id": "M_Y", "from": "M", "to": "Y", "status": "assumed"}]
+    named = verdict(model, make_claim("X", "Y", [["X", "M", "Y"]], conditioned_on=["X_bi_M"], design="randomized"))
+    assert "unknown variables: X_bi_M" in named["problems"]
+
+
+def test_conditioning_on_latent_variable_does_not_follow():
+    model = make_model([("U", "X"), ("U", "Y"), ("X", "Y")])
+    model["variables"][0]["role"] = "latent"
+    assert model["variables"][0]["id"] == "U"
+    for design in ("observational", "randomized"):
+        result = verdict(model, make_claim("X", "Y", [["X", "Y"]], conditioned_on=["U"], design=design))
+        assert result["verdict"] == "does_not_follow", design
+        assert result["problems"] == [
+            "conditioned_on contains latent variables: U (an unmeasured variable cannot be conditioned on)"]
+
+
+# ---------------------------------------------------------------- v0.2.0: export (AC8)
+
+def export_model():
+    quoted = 'q"x'
+    model = make_model([("X", "Y"), ("store size", "X"), ("X", quoted), (quoted, "Y"), ("U", "Y")],
+                       variables=["X", "Y", "U", "store size", quoted],
+                       statuses={("X", "Y"): "known", ("store size", "X"): "unknown", ("U", "Y"): "known"})
+    roles = {"X": "exposure", "Y": "outcome", "U": "latent", "store size": "context", quoted: "mediator"}
+    labels = {"X": "Ad spend", "Y": 'Sales "net"', "U": "Unmeasured demand", "store size": "Store size",
+              quoted: "Path\\step"}
+    for var in model["variables"]:
+        var["role"] = roles[var["id"]]
+        var["label"] = labels[var["id"]]
+    model["edges"].append(bidirected("X", "Y", "X_bi_Y"))
+    return model
+
+
+EXPECTED_DAGITTY = "\n".join([
+    "dag {",
+    "X [exposure]",
+    "Y [outcome]",
+    "U [latent]",
+    '"store size"',
+    r'"q\"x"',
+    "X -> Y",
+    '"store size" -> X',
+    r'X -> "q\"x"',
+    r'"q\"x" -> Y',
+    "U -> Y",
+    "X <-> Y",
+    "}",
+])
+
+EXPECTED_DOT = "\n".join([
+    'digraph "m" {',
+    '"X" [label="Ad spend"]',
+    r'"Y" [label="Sales \"net\""]',
+    '"U" [label="Unmeasured demand"]',
+    '"store size" [label="Store size"]',
+    r'"q\"x" [label="Path\\step"]',
+    '"X" -> "Y" [style=solid]',
+    '"store size" -> "X" [style=dotted]',
+    r'"X" -> "q\"x" [style=dashed]',
+    r'"q\"x" -> "Y" [style=dashed]',
+    '"U" -> "Y" [style=solid]',
+    '"X" -> "Y" [style=dashed, dir=both]',
+    "}",
+])
+
+
+def git_state(store):
+    head = subprocess.run(["git", "-C", str(store), "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+    status = subprocess.run(["git", "-C", str(store), "status", "--porcelain", "--untracked-files=all"],
+                            capture_output=True, text=True, check=True)
+    return head.stdout, status.stdout
+
+
+def test_export_dagitty_and_dot_text_and_store_unchanged(cli, store):
+    assert save(cli, export_model())[0] == 0
+    before = git_state(store)
+    model_text = (store / "models" / "m.yaml").read_text(encoding="utf-8")
+    code, out = cli("export", "--model", "m", "--format", "dagitty")
+    assert code == 0 and out == {"model": "m", "revision": 1, "format": "dagitty", "text": EXPECTED_DAGITTY}
+    code, out = cli("export", "--model", "m", "--format", "dot")
+    assert code == 0 and out == {"model": "m", "revision": 1, "format": "dot", "text": EXPECTED_DOT}
+    assert git_state(store) == before and before[1] == ""
+    assert (store / "models" / "m.yaml").read_text(encoding="utf-8") == model_text
+
+
+def test_export_unknown_format_exits_1_and_invalid_model_exits_2(cli, store):
+    assert save(cli, make_model([("X", "Y")]))[0] == 0
+    code, out = cli("export", "--model", "m", "--format", "graphml")
+    assert code == 1 and out["error"].startswith("usage: unknown format graphml")
+    path = store / "models" / "m.yaml"
+    broken = yaml.safe_load(path.read_text(encoding="utf-8"))
+    broken["variables"][0]["role"] = "confounder"
+    path.write_text(yaml.safe_dump(broken), encoding="utf-8")
+    code, out = cli("export", "--model", "m", "--format", "dot")
+    assert code == 2 and any("role must be one of" in e for e in out["errors"])
