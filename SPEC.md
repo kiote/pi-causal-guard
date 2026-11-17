@@ -1,4 +1,4 @@
-# pi-causal-guard specification (v0.1.0)
+# pi-causal-guard specification (v0.2.0)
 
 ## Goal
 
@@ -18,6 +18,12 @@ Out of scope:
 - Effect estimation. The checks are structure checks only.
 - Writes to the search repository. It is read with `git grep` on one ref only.
 - Domain-specific check logic. The checker is generic.
+
+v0.2.0 scope: optional variable `role` (fixed list), optional edge `type` (`bidirected` for an unmeasured common
+cause), the latent-conditioning rule, and the `export` subcommand (DAGitty, DOT). Reason: DAGitty roles, ADMG graphs
+(Ananke, pywhy-graphs), and DoWhy DOT input. Not in v0.2.0: a new extension tool, import from DAGitty or DOT, PAG or
+CPDAG edges, a new `schema_version` (it stays 2), and automatic role migration. Breaking change: a model with a
+`role` value outside the list fails validation.
 
 ## Components
 
@@ -72,6 +78,8 @@ Models and the registry are committed to the store git. `checks.jsonl` and `log.
   add_variables, add_sources: {...}}`) → applies, validates, revision + 1, sets `last_gathered` to today when `facts`
   is not empty, commits, and appends the request and diff to `log.jsonl`. Output `{id, revision, diff: [lines]}`.
 - `validate --model ID` → `{ok, errors}` (exit 2 when not ok).
+- `export --model ID --format dagitty|dot` → `{model, revision, format, text}`. Read-only: no write, no commit.
+  An invalid model gives exit 2. An unknown format is a usage error (exit 1). See Export.
 - `has-check --ids a,b` → `{missing: [ids not in checks.jsonl]}`.
 
 ### Model schema v2
@@ -82,8 +90,21 @@ YAML. Unknown extra keys are kept.
   `status` (`hypothesis`|`reviewed`), `last_gathered` (YYYY-MM-DD), `variables` [{`id`, `label`, `definition`}],
   `edges` [{`id`, `from`, `to`, `status` (`known`|`assumed`|`unknown`), `reason`, `sources` [source keys]}],
   `sources` {key: {`ref`, `use`}}.
-- Rules: unique variable ids and edge ids; no duplicate `from`→`to`; no dangling edge; no directed cycle; each edge
-  source key exists; a `known` edge has at least 1 source.
+- Optional variable `role` (added in v0.2.0): one of `exposure`, `outcome`, `mediator`, `context`, `selection`,
+  `measurement`, `latent`, `other`. A missing `role` is valid. Any other value is a validation error.
+  `latent` means the variable is not measured.
+- Optional edge `type` (added in v0.2.0): `directed` (the default when missing) or `bidirected`. A bidirected edge
+  `a <-> b` means an unmeasured common cause of `a` and `b` (an ADMG edge). The order of `from` and `to` has no
+  meaning for a bidirected edge.
+- Rules: unique variable ids and edge ids; no duplicate directed `from`→`to`; no two bidirected edges on the same
+  unordered pair; a directed edge and a bidirected edge on the same pair are allowed; no edge from a variable to
+  itself; no dangling edge; no directed cycle (bidirected edges are not part of the cycle test); each edge source
+  key exists; a `known` edge has at least 1 source. The same `status`, `reason`, and `sources` rules apply to both
+  edge types.
+- `status` and `sources` are independent. A source does not make an edge `known`, and an edge without textual
+  support can still be correct. Give an edge that an LLM proposed the status `assumed`, and give a model built
+  from such edges the status `hypothesis`, until a person or data confirms it.
+- `update` validates `add_edges`, `change_edges`, and `add_variables` with the same rules.
 
 ### Claim format
 
@@ -105,7 +126,29 @@ Per claim:
 5. All designs: `conditioned_on` contains a descendant of `cause` → `does_not_follow` (overcontrol or collider bias).
    This is stricter than the textbook rule: it also flags a descendant with no path to `effect`.
 
+6. All designs: `conditioned_on` contains a variable with role `latent` → `does_not_follow` (an unmeasured variable
+   cannot be conditioned on).
+
 Otherwise the verdict is `follows`. Unknown variables in a claim → `does_not_follow`.
+
+Bidirected edges: the checker replaces each bidirected edge `e` between `a` and `b` with a hidden node and the
+directed edges hidden→`a` and hidden→`b`. Rules 2, 3, and 5 use this graph. A hidden node is not a
+variable: a claim that names it has an unknown variable. Rule 1 accepts only directed edges, so a claimed path that
+uses a bidirected edge → `does_not_follow`. Rule 4 lists only directed edges. In an open backdoor path, a
+bidirected step shows as `<-> b`. A model without bidirected edges gives the same results and `check_id`s as in
+v0.1.0.
+
+### Export
+
+The YAML model stays the source of truth. The export is one-way and drops `reason`, `sources`, and facts.
+
+- `dagitty`: `dag {`, then one line per variable in model order (`id` plus ` [exposure]`, ` [outcome]`, or
+  ` [latent]` for these roles; no attribute for other roles), then one line per edge in model order (`a -> b` or
+  `a <-> b`), then `}`. An id that does not match `^[A-Za-z_][A-Za-z0-9_]*$` is written in double quotes, with `\`
+  and `"` escaped.
+- `dot`: `digraph "<model id>" {`, then one node line per variable `"<id>" [label="<label>"]`, then one line per
+  edge `"a" -> "b" [style=solid|dashed|dotted]` for status `known`|`assumed`|`unknown`; a bidirected edge adds
+  `dir=both`. All ids and labels are quoted, with `\` and `"` escaped. Then `}`.
 
 `check_id` = `<model>@r<revision>#<claim id>-<first 6 hex of sha1(canonical claim JSON)>`.
 
@@ -134,7 +177,8 @@ Otherwise the verdict is `follows`. Unknown variables in a claim → `does_not_f
 Each tool calls the helper. A non-zero exit returns the error text as the tool result, marked as an error.
 
 - `causal_check {model, claims}` (missing `conditioned_on` and `ruled_out` default to `[]`).
-- `causal_model_save {model}` (the model JSON; optional `keywords` for a new domain).
+- `causal_model_save {model}` (the model JSON; optional `keywords` for a new domain). The tool description names
+  the optional variable `role` and edge `type`.
 - `causal_model_update {model, facts, add_edges, change_edges, remove_edges, add_variables, add_sources}`.
 - `causal_record {domain, model?, causal, check_ids?, update: "none"|"applied"|"proposed", note?}`.
   `causal: true` needs at least one `check_id` that `has-check` finds, or a note that starts with `unchecked:`.
@@ -172,3 +216,22 @@ Only for completed runs where the preflight message was injected for the last us
 - AC3: the extension loads in pi's `DefaultResourceLoader` with 0 errors and registers the 4 tools.
 - AC4: an end-to-end test with the real helper and a temporary store (save, session search, check, record) passes
   without a gate note.
+
+v0.2.0 additions (all in `python -m pytest tests`, except AC9 and AC10):
+
+- AC5: role validation: each listed role passes; a missing role passes; an unlisted role fails; `update` with
+  `add_variables` that has an unlisted role is rejected and changes nothing.
+- AC6: edge type validation: a missing type is `directed`; an unknown type fails; a bidirected self edge fails;
+  two bidirected edges on one pair (either order) fail; a directed edge plus a bidirected edge on one pair pass;
+  bidirected edges `a <-> b` plus `b -> a` do not count as a cycle; a directed cycle still fails.
+- AC7: checks with bidirected edges: X->Y with X<->Y, observational → `does_not_follow` with `<-> Y` in the
+  problem; randomized → `follows`; X->M->Y with X<->Y, M not conditioned, front-door style claim through M
+  observational → `does_not_follow`; X->Y with X<->Z and Z->Y, conditioned on Z → `follows`; a claimed path over a
+  bidirected edge → `does_not_follow`; conditioning on a `latent` variable → `does_not_follow`.
+- AC8: export: `dagitty` and `dot` output for a fixed model equals the expected text exactly (roles, bidirected
+  edges, quoting of an id with a space or a quote, status styles); `export` does not change the store git; an
+  unknown format exits 1 with one JSON object.
+- AC9: backward compatibility: every existing v0.1.0 test passes unchanged; `node --test tests/` passes.
+- AC10 (coordinator, not in the repo tests): the DAGitty parser `r/inst/js/dagitty-alg.js` from
+  `jtextor/dagitty` (pinned commit) parses the `dagitty` export of a model with roles, a bidirected edge, and a
+  quoted id, and gives the same nodes, edges, and roles.
