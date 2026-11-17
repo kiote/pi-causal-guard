@@ -148,7 +148,10 @@ The YAML model stays the source of truth. The export is one-way and drops `reaso
   and `"` escaped.
 - `dot`: `digraph "<model id>" {`, then one node line per variable `"<id>" [label="<label>"]`, then one line per
   edge `"a" -> "b" [style=solid|dashed|dotted]` for status `known`|`assumed`|`unknown`; a bidirected edge adds
-  `dir=both`. All ids and labels are quoted, with `\` and `"` escaped. Then `}`.
+  `dir=both` after the style: `[style=dashed, dir=both]`. All ids and labels are quoted, with `\` and `"` escaped. Then `}`.
+- Both formats: no indentation, lines joined with `\n`, and `text` ends with `}` (no trailing newline).
+- An unknown `--format` value exits 1 with one JSON error object. A missing `--format` is an argparse usage error,
+  as for the other subcommands.
 
 `check_id` = `<model>@r<revision>#<claim id>-<first 6 hex of sha1(canonical claim JSON)>`.
 
