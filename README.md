@@ -7,7 +7,7 @@ claims against it, and record model updates. The full rules are in [`SPEC.md`](S
 ## Install
 
 ```bash
-pi install git:github.com/kiote/pi-causal-guard@v0.1.0
+pi install git:github.com/kiote/pi-causal-guard@v0.2.0
 ```
 
 To try it in one session without installing:
@@ -47,7 +47,8 @@ Requirements: Python 3 with `networkx` 3.3 or later and `PyYAML` (`pip install n
 4. **Command.** `/causal-guard [status|off|on]` shows the last lookup and record, or switches the guard for the session.
 
 The checks are structure checks on the model graph (directed paths, backdoor d-separation for observational claims,
-unclaimed alternative paths, risky edges, conditioning on a descendant of the cause). See `SPEC.md` for the rules.
+unclaimed alternative paths, risky edges, conditioning on a descendant of the cause, conditioning on a `latent`
+variable). See `SPEC.md` for the rules.
 
 ## Store and config
 
@@ -80,6 +81,45 @@ domains:
 
 `causal_model_save` with `keywords` in the model object creates a new domain with these keywords.
 
+## Model format
+
+Each model is one YAML file `models/<id>.yaml` (schema v2). See `SPEC.md` for the required keys and rules.
+
+- Variable `role` (optional): one of `exposure`, `outcome`, `mediator`, `context`, `selection`, `measurement`,
+  `latent`, `other`. `latent` means the variable is not measured. Any other value fails validation.
+- Edge `type` (optional): `directed` (the default) or `bidirected`. A bidirected edge `a <-> b` means an unmeasured
+  common cause of `a` and `b`. The order of `from` and `to` has no meaning for a bidirected edge.
+- Edge `status` and `sources` are independent. A source does not make an edge `known`. Give an edge that an LLM
+  proposed the status `assumed`, and give the model the status `hypothesis`, until a person or data confirms it.
+
+Part of a model:
+
+```yaml
+variables:
+  - id: discount
+    label: Discount shown
+    definition: The checkout page shows a discount banner.
+    role: exposure
+  - id: conversion
+    label: Conversion
+    definition: The user completes the order.
+    role: outcome
+edges:
+  - id: e1
+    from: discount
+    to: conversion
+    status: assumed
+    reason: A discount can make the order cheaper.
+    sources: []
+  - id: e2
+    from: discount
+    to: conversion
+    type: bidirected
+    status: assumed
+    reason: Unmeasured purchase intent can affect both.
+    sources: []
+```
+
 ## Environment
 
 | Variable | Effect |
@@ -103,7 +143,11 @@ python bin/causal_store.py save --model ID         < model JSON (optional "keywo
 python bin/causal_store.py update --model ID       < {"facts": [...], "add_edges": [...], ...}
 python bin/causal_store.py validate --model ID
 python bin/causal_store.py has-check --ids a,b
+python bin/causal_store.py export --model ID --format dagitty
 ```
+
+`export` writes the model as DAGitty (`--format dagitty`) or DOT (`--format dot`) text in the `text` field. It is
+read-only. The YAML model stays the source of truth. The export is one-way and drops `reason`, `sources`, and facts.
 
 ## Tests
 
@@ -116,6 +160,14 @@ The Node tests load pi from env `PI_SDK_ROOT` (the `@earendil-works/pi-coding-ag
 `npm root -g`. They use `tests/fake_causal_store.py` as the store helper (except the end-to-end test) and a temporary
 home folder for the log. They need Node 22.15 or later (they import the `.ts` extension directly and use
 `module.registerHooks`). The tests were run on Windows only.
+
+## Background
+
+- DAGitty: https://arxiv.org/abs/1508.04633
+- Ananke (ADMG): https://arxiv.org/abs/2301.11477
+- pywhy-graphs: https://github.com/py-why/pywhy-graphs
+- DoWhy: https://arxiv.org/abs/2011.04216
+- Provenance gap: https://arxiv.org/abs/2606.15833
 
 ## License
 

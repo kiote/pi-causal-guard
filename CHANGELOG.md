@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.0] - 2026-11-17
+
+### Added
+
+- Optional variable `role`: `exposure`, `outcome`, `mediator`, `context`, `selection`, `measurement`, `latent`,
+  `other`. `latent` means the variable is not measured.
+- Optional edge `type`: `directed` (default) or `bidirected`. A bidirected edge `a <-> b` means an unmeasured common
+  cause of `a` and `b`. The checks replace it with a hidden common cause. A model without bidirected edges gives the
+  same results and `check_id`s as in v0.1.0.
+- Check rule: a claim that conditions on a `latent` variable gives `does_not_follow`.
+- `bin/causal_store.py export --model ID --format dagitty|dot`: read-only, one-way export to DAGitty or DOT.
+
+### Breaking
+
+- A model with a `role` outside the list now fails validation. `schema_version` stays 2.
+
 ## [0.1.0] - 2026-11-16
 
 First public release.
