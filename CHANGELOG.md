@@ -15,6 +15,9 @@
 ### Breaking
 
 - A model with a `role` outside the list now fails validation. `schema_version` stays 2.
+- An edge with a `type` other than `directed` or `bidirected` now fails validation. In v0.1.0, an unknown edge key
+  `type` was kept.
+- A model that already had `role: latent` can get new verdicts from the latent-conditioning rule.
 
 ## [0.1.0] - 2026-11-16
 

@@ -213,6 +213,12 @@ def edge_type(edge):
     return edge.get("type", "directed")
 
 
+def edge_arrow(edge):
+    """`from->to`, or `from<->to` for a bidirected edge (used in update diffs)."""
+    arrow = "<->" if edge_type(edge) == "bidirected" else "->"
+    return f"{edge.get('from')}{arrow}{edge.get('to')}"
+
+
 def validate_model(model):
     """Return the list of schema v2 errors (empty when valid)."""
     import networkx as nx
@@ -286,7 +292,7 @@ def validate_model(model):
             if frozenset((src, dst)) in bidirected_pairs:
                 errors.append(f"duplicate bidirected edge {src}<->{dst} ({eid})")
             bidirected_pairs.add(frozenset((src, dst)))
-        if src == dst:
+        if src == dst and src in var_ids:
             errors.append(f"edge {eid} goes from {src} to itself")
         dangling = [n for n in (src, dst) if n not in var_ids]
         if dangling:
@@ -425,10 +431,13 @@ def open_backdoor_path(graph, cause, effect, conditioned):
         return False, None, backdoor_graph
     skeleton = backdoor_graph.to_undirected(as_view=True)
     best = None
+    def length(path):
+        return sum(not isinstance(n, HiddenNode) for n in path)
+
     for i, path in enumerate(nx.all_simple_paths(skeleton, cause, effect)):
         if i >= OPEN_PATH_SEARCH_LIMIT:
             break
-        if (best is None or len(path) < len(best)) and trail_is_open(backdoor_graph, path, z):
+        if (best is None or length(path) < length(best)) and trail_is_open(backdoor_graph, path, z):
             best = path
     return True, best, backdoor_graph
 
@@ -724,7 +733,7 @@ def apply_update(model, data):
             continue
         edge = edges_by_id.pop(eid)
         edges.remove(edge)
-        diff.append(f"- edge {eid} {edge.get('from')}->{edge.get('to')}")
+        diff.append(f"- edge {eid} {edge_arrow(edge)}")
     for change in change_edges:
         if not isinstance(change, dict) or change.get("id") not in edges_by_id:
             errors.append(f"change_edges: unknown edge {change.get('id') if isinstance(change, dict) else change}")
@@ -737,7 +746,7 @@ def apply_update(model, data):
     for edge in add_edges:
         edges.append(edge)
         if isinstance(edge, dict):
-            diff.append(f"+ edge {edge.get('id')} {edge.get('from')}->{edge.get('to')} ({edge.get('status')})")
+            diff.append(f"+ edge {edge.get('id')} {edge_arrow(edge)} ({edge.get('status')})")
         else:
             diff.append(f"+ edge {edge}")
     if errors:

@@ -636,3 +636,35 @@ def test_export_unknown_format_exits_1_and_invalid_model_exits_2(cli, store):
     path.write_text(yaml.safe_dump(broken), encoding="utf-8")
     code, out = cli("export", "--model", "m", "--format", "dot")
     assert code == 2 and any("role must be one of" in e for e in out["errors"])
+
+
+# ---------------------------------------------------------------- v0.2.0: review fixes
+
+def test_open_path_display_prefers_fewest_variables():
+    # X <- Z -> Y and X <-> Y are both open; the bidirected path has fewer variables.
+    model = with_bidirected([("X", "Y"), ("Z", "X"), ("Z", "Y")], [("X", "Y")])
+    result = verdict(model, make_claim("X", "Y", [["X", "Y"]]))
+    assert result["problems"] == ["open backdoor path given nothing: X <-> Y"]
+
+
+def test_update_change_edges_with_unknown_type_is_rejected(cli, store):
+    assert save(cli, make_model([("X", "Y")]))[0] == 0
+    code, out = cli("update", "--model", "m", stdin={"change_edges": [{"id": "X_Y", "type": "causal"}]})
+    assert code == 2 and any("type must be one of" in e for e in out["errors"]), out
+
+
+def test_update_diff_shows_bidirected_arrow(cli, store):
+    assert save(cli, make_model([("X", "Y")]))[0] == 0
+    code, out = cli("update", "--model", "m", stdin={"add_edges": [bidirected("X", "Y")]})
+    assert code == 0, out
+    assert "+ edge X_bi_Y X<->Y (assumed)" in out["diff"]
+    code, out = cli("update", "--model", "m", stdin={"remove_edges": ["X_bi_Y"]})
+    assert code == 0 and "- edge X_bi_Y X<->Y" in out["diff"], out
+
+
+def test_edge_without_endpoints_has_no_self_edge_error():
+    model = make_model([("X", "Y")])
+    model["edges"].append({"id": "e", "status": "assumed", "reason": "r", "sources": []})
+    errors = causal_store.validate_model(model)
+    assert any(e.startswith("dangling edge e") for e in errors)
+    assert not any("to itself" in e for e in errors)
