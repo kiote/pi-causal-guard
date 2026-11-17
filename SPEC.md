@@ -22,8 +22,9 @@ Out of scope:
 v0.2.0 scope: optional variable `role` (fixed list), optional edge `type` (`bidirected` for an unmeasured common
 cause), the latent-conditioning rule, and the `export` subcommand (DAGitty, DOT). Reason: DAGitty roles, ADMG graphs
 (Ananke, pywhy-graphs), and DoWhy DOT input. Not in v0.2.0: a new extension tool, import from DAGitty or DOT, PAG or
-CPDAG edges, a new `schema_version` (it stays 2), and automatic role migration. Breaking change: a model with a
-`role` value outside the list fails validation.
+CPDAG edges, a new `schema_version` (it stays 2), and automatic role migration. Breaking changes: a model with a
+`role` value outside the list fails validation, and an edge with a `type` value other than `directed` or
+`bidirected` fails validation. A v0.1.0 model with `role: latent` can get new verdicts from rule 6.
 
 ## Components
 
@@ -135,8 +136,9 @@ Bidirected edges: the checker replaces each bidirected edge `e` between `a` and 
 directed edges hidden→`a` and hidden→`b`. Rules 2, 3, and 5 use this graph. A hidden node is not a
 variable: a claim that names it has an unknown variable. Rule 1 accepts only directed edges, so a claimed path that
 uses a bidirected edge → `does_not_follow`. Rule 4 lists only directed edges. In an open backdoor path, a
-bidirected step shows as `<-> b`. A model without bidirected edges gives the same results and `check_id`s as in
-v0.1.0.
+bidirected step shows as `<-> b`. "Shortest" counts the variables on the path; hidden nodes do not count. The
+`update` diff shows a bidirected edge as `a<->b`. A model without bidirected edges gives the same results and
+`check_id`s as in v0.1.0.
 
 ### Export
 
