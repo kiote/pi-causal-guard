@@ -7,7 +7,7 @@ Exit codes: 0 success, 2 validation error (bad input or invalid model), 1 other 
 Store root: env PI_CAUSAL_STORE, default ~/.pi/agent/causal-models (own git repo).
 Layout: config.yaml, registry.yaml, models/<id>.yaml, checks.jsonl, log.jsonl.
 
-Subcommands: lookup, check, save, update, validate, has-check.
+Subcommands: lookup, check, save, update, validate, export, has-check.
 """
 import argparse
 import datetime as dt
@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -43,6 +44,12 @@ SEARCH_MIN_LETTERS = 4
 MODEL_STATUSES = ("hypothesis", "reviewed")
 EDGE_STATUSES = ("known", "assumed", "unknown")
 RISKY_EDGE_STATUSES = ("assumed", "unknown")
+EDGE_TYPES = ("directed", "bidirected")
+VARIABLE_ROLES = ("exposure", "outcome", "mediator", "context", "selection", "measurement", "latent", "other")
+EXPORT_FORMATS = ("dagitty", "dot")
+DAGITTY_ROLE_ATTRIBUTES = ("exposure", "outcome", "latent")
+DAGITTY_PLAIN_ID_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+DOT_EDGE_STYLES = {"known": "solid", "assumed": "dashed", "unknown": "dotted"}
 CLAIM_DESIGNS = ("randomized", "observational")
 SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -201,6 +208,11 @@ def is_date(value):
     return True
 
 
+def edge_type(edge):
+    """Edge type; a missing type is directed."""
+    return edge.get("type", "directed")
+
+
 def validate_model(model):
     """Return the list of schema v2 errors (empty when valid)."""
     import networkx as nx
@@ -245,12 +257,14 @@ def validate_model(model):
         for key in ("label", "definition"):
             if not is_text(var.get(key)):
                 errors.append(f"variable {var['id']} needs a non-empty {key}")
+        if "role" in var and var["role"] not in VARIABLE_ROLES:
+            errors.append(f"variable {var['id']} role must be one of {', '.join(VARIABLE_ROLES)}")
 
     edges = model.get("edges")
     if not isinstance(edges, list):
         errors.append("edges must be a list")
         edges = []
-    edge_ids, pairs = set(), set()
+    edge_ids, pairs, bidirected_pairs = set(), set(), set()
     graph = nx.DiGraph()
     for i, edge in enumerate(edges):
         if not isinstance(edge, dict) or not is_text(edge.get("id")):
@@ -261,13 +275,23 @@ def validate_model(model):
             errors.append(f"duplicate edge id {eid}")
         edge_ids.add(eid)
         src, dst = edge.get("from"), edge.get("to")
-        if (src, dst) in pairs:
-            errors.append(f"duplicate edge {src}->{dst} ({eid})")
-        pairs.add((src, dst))
+        etype = edge_type(edge)
+        if etype not in EDGE_TYPES:
+            errors.append(f"edge {eid} type must be one of {', '.join(EDGE_TYPES)}")
+        elif etype == "directed":
+            if (src, dst) in pairs:
+                errors.append(f"duplicate edge {src}->{dst} ({eid})")
+            pairs.add((src, dst))
+        else:
+            if frozenset((src, dst)) in bidirected_pairs:
+                errors.append(f"duplicate bidirected edge {src}<->{dst} ({eid})")
+            bidirected_pairs.add(frozenset((src, dst)))
+        if src == dst:
+            errors.append(f"edge {eid} goes from {src} to itself")
         dangling = [n for n in (src, dst) if n not in var_ids]
         if dangling:
             errors.append(f"dangling edge {eid}: unknown variable {', '.join(map(str, dangling))}")
-        else:
+        elif etype == "directed" and src != dst:
             graph.add_edge(src, dst)
         if edge.get("status") not in EDGE_STATUSES:
             errors.append(f"edge {eid} status must be one of {', '.join(EDGE_STATUSES)}")
@@ -289,12 +313,31 @@ def validate_model(model):
 
 
 def model_graph(model):
+    """Directed graph of the variables and the directed edges (bidirected edges are left out)."""
     import networkx as nx
     graph = nx.DiGraph()
     graph.add_nodes_from(v["id"] for v in model["variables"])
     for edge in model["edges"]:
-        graph.add_edge(edge["from"], edge["to"], id=edge["id"], status=edge["status"])
+        if edge_type(edge) == "directed":
+            graph.add_edge(edge["from"], edge["to"], id=edge["id"], status=edge["status"])
     return graph
+
+
+@dataclass(frozen=True)
+class HiddenNode:
+    """Unmeasured common cause of a bidirected edge. Not a str, so it never equals a variable id."""
+    edge_id: str
+
+
+def canonical_graph(model, graph):
+    """graph plus, for each bidirected edge a <-> b, a hidden node with the edges hidden->a and hidden->b."""
+    canonical = graph.copy()
+    for edge in model["edges"]:
+        if edge_type(edge) == "bidirected":
+            hidden = HiddenNode(edge["id"])
+            canonical.add_edge(hidden, edge["from"])
+            canonical.add_edge(hidden, edge["to"])
+    return canonical
 
 
 # ---------------------------------------------------------------- claim checks
@@ -345,9 +388,15 @@ def format_directed(path):
 
 
 def format_trail(graph, path):
+    """Trail as 'a -> b <- c'; a step over a hidden node a <- hidden -> b shows as 'a <-> b'."""
     out = [path[0]]
     for a, b in zip(path, path[1:]):
-        out.append(f"-> {b}" if graph.has_edge(a, b) else f"<- {b}")
+        if isinstance(b, HiddenNode):
+            continue
+        if isinstance(a, HiddenNode):
+            out.append(f"<-> {b}")
+        else:
+            out.append(f"-> {b}" if graph.has_edge(a, b) else f"<- {b}")
     return " ".join(out)
 
 
@@ -384,8 +433,11 @@ def open_backdoor_path(graph, cause, effect, conditioned):
     return True, best, backdoor_graph
 
 
-def check_claim(model, graph, claim):
-    """Apply the verdict rules 1-5 of SPEC.md C-1 to one claim (already format-checked)."""
+def check_claim(model, graph, canonical, claim):
+    """Apply the verdict rules 1-6 of SPEC.md C-1 to one claim (already format-checked).
+
+    graph: variables and directed edges (rules 1, 4, variable lookup). canonical: graph plus a hidden node per
+    bidirected edge (rules 2, 3, 5)."""
     import networkx as nx
     problems, notes = [], []
     cause, effect = claim["cause"], claim["effect"]
@@ -407,7 +459,7 @@ def check_claim(model, graph, claim):
     endpoints_known = cause in graph and effect in graph
     # 2. Backdoor (observational only).
     if endpoints_known and claim["design"] == "observational" and all(n in graph for n in conditioned):
-        is_open, open_path, backdoor_graph = open_backdoor_path(graph, cause, effect, conditioned)
+        is_open, open_path, backdoor_graph = open_backdoor_path(canonical, cause, effect, conditioned)
         if is_open:
             given = ", ".join(conditioned) if conditioned else "nothing"
             trail = format_trail(backdoor_graph, open_path) if open_path else "open backdoor (path not listed)"
@@ -415,14 +467,20 @@ def check_claim(model, graph, claim):
 
     # 2b. Conditioning on a descendant of cause (all designs): overcontrol or collider bias.
     if endpoints_known and all(n in graph for n in conditioned):
-        bad = sorted(set(conditioned) & nx.descendants(graph, cause))
+        bad = sorted(set(conditioned) & nx.descendants(canonical, cause))
         if bad:
             problems.append(f"conditioned_on contains descendants of {cause}: {', '.join(bad)} (overcontrol or collider bias)")
+
+    # 6. Conditioning on a latent variable (all designs): it is not measured.
+    latent = {v["id"] for v in model["variables"] if v.get("role") == "latent"}
+    bad_latent = sorted(set(conditioned) & latent)
+    if bad_latent:
+        problems.append(f"conditioned_on contains latent variables: {', '.join(bad_latent)} (an unmeasured variable cannot be conditioned on)")
 
     # 3. Alternatives: other directed paths cause -> effect, neither claimed nor ruled out (listed up to a limit).
     alternatives, truncated = [], False
     if endpoints_known:
-        for path in nx.all_simple_paths(graph, cause, effect):
+        for path in nx.all_simple_paths(canonical, cause, effect):
             if path not in claimed and path not in ruled_out:
                 if len(alternatives) >= MAX_ALTERNATIVES:
                     truncated = True
@@ -472,7 +530,8 @@ def check_claims(model, claims):
     if errors:
         raise ValidationError(errors)
     graph = model_graph(model)
-    return [check_claim(model, graph, c) for c in claims]
+    canonical = canonical_graph(model, graph)
+    return [check_claim(model, graph, canonical, c) for c in claims]
 
 
 # ---------------------------------------------------------------- lookup
@@ -735,6 +794,53 @@ def cmd_validate(root, model_id):
     return {"ok": not errors, "errors": errors}
 
 
+def dagitty_id(value):
+    if DAGITTY_PLAIN_ID_RE.fullmatch(value):
+        return value
+    return quote_text(value)
+
+
+def quote_text(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def export_dagitty(model):
+    lines = ["dag {"]
+    for var in model["variables"]:
+        role = var.get("role")
+        lines.append(dagitty_id(var["id"]) + (f" [{role}]" if role in DAGITTY_ROLE_ATTRIBUTES else ""))
+    for edge in model["edges"]:
+        arrow = "<->" if edge_type(edge) == "bidirected" else "->"
+        lines.append(f"{dagitty_id(edge['from'])} {arrow} {dagitty_id(edge['to'])}")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def export_dot(model):
+    lines = [f"digraph {quote_text(model['id'])} {{"]
+    for var in model["variables"]:
+        lines.append(f"{quote_text(var['id'])} [label={quote_text(var['label'])}]")
+    for edge in model["edges"]:
+        attributes = f"style={DOT_EDGE_STYLES[edge['status']]}"
+        if edge_type(edge) == "bidirected":
+            attributes += ", dir=both"
+        lines.append(f"{quote_text(edge['from'])} -> {quote_text(edge['to'])} [{attributes}]")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def cmd_export(root, model_id, export_format):
+    """Read-only export of a valid model as DAGitty or DOT text."""
+    if export_format not in EXPORT_FORMATS:
+        raise UsageError(f"unknown format {export_format} (use {' or '.join(EXPORT_FORMATS)})")
+    model = load_model(root, model_id)
+    errors = validate_model(model)
+    if errors:
+        raise ValidationError([f"model {model_id} is invalid: {e}" for e in errors])
+    text = export_dagitty(model) if export_format == "dagitty" else export_dot(model)
+    return {"model": model_id, "revision": model["revision"], "format": export_format, "text": text}
+
+
 def cmd_has_check(root, ids):
     wanted = [i.strip() for i in ids.split(",") if i.strip()]
     known = set()
@@ -775,6 +881,9 @@ def build_parser():
     sub.add_parser("lookup").add_argument("--prompt-file", required=True)
     for name in ("check", "save", "update", "validate"):
         sub.add_parser(name).add_argument("--model", required=True)
+    export = sub.add_parser("export")
+    export.add_argument("--model", required=True)
+    export.add_argument("--format", required=True)
     sub.add_parser("has-check").add_argument("--ids", required=True)
     return parser
 
@@ -801,6 +910,10 @@ def run(argv):
             return out, 0 if out["ok"] else 2
         if args.command == "has-check":
             return cmd_has_check(root, args.ids), 0
+        if args.command == "export":
+            return cmd_export(root, args.model, args.format), 0
+    except UsageError as exc:
+        return {"error": f"usage: {exc}"}, 1
     except ValidationError as exc:
         return {"error": "validation failed", "errors": exc.errors}, 2
     except subprocess.CalledProcessError as exc:

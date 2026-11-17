@@ -309,7 +309,7 @@ export default function (pi: ExtensionAPI) {
     name: "causal_model_save",
     label: "Causal model save",
     description:
-      "Create or replace a causal model (schema v2: schema_version, id, domain, title, status, last_gathered, variables, edges, sources). Add keywords to the model for a new domain. The store validates, bumps the revision, and commits.",
+      "Create or replace a causal model (schema v2: schema_version, id, domain, title, status, last_gathered, variables, edges, sources). Optional variable role: exposure, outcome, mediator, context, selection, measurement, latent (not measured), or other. Optional edge type: directed (default) or bidirected (an unmeasured common cause of from and to). Add keywords to the model for a new domain. The store validates, bumps the revision, and commits.",
     promptSnippet: "Create or replace a causal model in the store",
     parameters: Type.Object({
       model: Type.Object(
