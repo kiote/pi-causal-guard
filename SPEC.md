@@ -1,4 +1,4 @@
-# pi-causal-guard specification (v0.2.0)
+# pi-causal-guard specification (v0.3.0)
 
 ## Goal
 
@@ -50,6 +50,29 @@ runs `git init`, and writes the default `config.yaml` and `registry.yaml`.
 
 Models and the registry are committed to the store git. `checks.jsonl` and `log.jsonl` are not committed.
 
+### External model files (v0.3.0)
+
+Reason: a model can have exactly one copy in another repository (for example a shared team repository), and the
+store still checks, updates, and exports it.
+
+- `registry.yaml` can have a top-level map `model_paths: {<model id>: <path>}`. A path is absolute or starts with
+  `~` (expanded). Any other path is a validation error when the model is used.
+- The model file of an id is the mapped path when the id is in `model_paths`, else `models/<id>.yaml`. Every
+  subcommand (`lookup`, `check`, `save`, `update`, `validate`, `export`) uses this file. `lookup` and `save` report
+  it as `path`.
+- A missing external file gives the validation error `model not found: <id> (<path>)`. `lookup` skips the model,
+  as for a missing store file.
+- `save` and `update` write the external file and do not commit it: it belongs to the other repository. They commit
+  `registry.yaml` only when it changed. When no store file changed, they make no commit and do not fail.
+  `update` still appends to `log.jsonl`.
+- `save` of an id that is not in `model_paths` writes `models/<id>.yaml`, as before.
+- `link --model ID --path P` → reads P and validates the model (schema v2, and `id` equals ID). It sets
+  `model_paths[ID] = P` (the path as given), adds the model to its domain, removes `models/<ID>.yaml` from the store
+  (`git rm`) when it exists, and commits (`link <ID>`). Output `{id, path, revision, removed_store_copy}`.
+  An invalid model, an id mismatch, a missing file, or a path that is not absolute gives exit 2 and changes
+  nothing.
+- Not in v0.3.0: `unlink`, a tool in the extension for `link`, and relative paths.
+
 ### Config
 
 | Key | Default | Meaning |
@@ -82,6 +105,7 @@ Models and the registry are committed to the store git. `checks.jsonl` and `log.
 - `export --model ID --format dagitty|dot` → `{model, revision, format, text}`. Read-only: no write, no commit.
   An invalid model gives exit 2. An unknown format is a usage error (exit 1). See Export.
 - `has-check --ids a,b` → `{missing: [ids not in checks.jsonl]}`.
+- `link --model ID --path P` (v0.3.0) → see External model files.
 
 ### Model schema v2
 
@@ -237,6 +261,19 @@ v0.2.0 additions (all in `python -m pytest tests`, except AC9 and AC10):
   edges, quoting of an id with a space or a quote, status styles); `export` does not change the store git; an
   unknown format exits 1 with one JSON object.
 - AC9: backward compatibility: every existing v0.1.0 test passes unchanged; `node --test tests/` passes.
+v0.3.0 additions (all in `python -m pytest tests`):
+
+- AC11: `link` of a valid external model: registry `model_paths` has the path, the model is in its domain, the
+  store copy is removed from the store git, and one commit `link <id>` exists. `link` with an invalid model, an id
+  mismatch, a missing file, or a relative path: exit 2, and the registry, the store files, and the store git HEAD
+  do not change.
+- AC12: on a linked model, `check`, `validate`, `export`, and `lookup` read the external file (`lookup` `path` is
+  the external path); `save` and `update` write it and bump its revision; the external file is not added to the
+  store git; the store git HEAD does not change when the registry does not change; `update` appends to `log.jsonl`.
+- AC13: a missing external file gives `model not found: <id> (<path>)` with exit 2 for `check`, and `lookup`
+  skips the model.
+- AC14: every earlier test passes unchanged; `node --test tests/` passes.
+
 - AC10 (coordinator, not in the repo tests): the DAGitty parser `r/inst/js/dagitty-alg.js` from
   `jtextor/dagitty` (pinned commit) parses the `dagitty` export of a model with roles, a bidirected edge, and a
   quoted id, and gives the same nodes, edges, and roles.
