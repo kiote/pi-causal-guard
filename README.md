@@ -99,6 +99,9 @@ repository); they commit `registry.yaml` only when it changed. `link` validates 
 python bin/causal_store.py link --model checkout-funnel --path ~/src/team-models/checkout-funnel.yaml
 ```
 
+`link` refuses a path inside the store and a store copy with uncommitted changes; commit or remove the store copy
+first. `save` of a linked model whose file is missing fails and creates no file.
+
 ## Model format
 
 Each model is one YAML file `models/<id>.yaml` (schema v2). See `SPEC.md` for the required keys and rules.

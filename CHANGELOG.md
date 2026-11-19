@@ -11,6 +11,10 @@
 - `bin/causal_store.py link --model ID --path P`: validates the model in P, sets `model_paths[ID] = P`, adds the model
   to its domain, removes the store copy `models/<ID>.yaml` when it exists, and commits `link <ID>`.
 - A missing external file gives `model not found: <id> (<path>)`; `lookup` skips the model.
+- `link` gives exit 2 and changes nothing for a path inside the store, a file that cannot be read as UTF-8 text, or
+  a store copy with uncommitted changes (untracked or modified). A repeated `link` with the same path makes no commit.
+- `save` of a linked id whose external file is missing gives `model not found: <id> (<path>)` and creates no file.
+  `lookup` also skips a model whose `model_paths` entry is invalid.
 
 ## [0.2.0] - 2026-11-17
 
