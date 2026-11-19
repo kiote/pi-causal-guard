@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0] - 2026-11-19
+
+### Added
+
+- External model files: `registry.yaml` can map a model id to a file outside the store with
+  `model_paths: {<model id>: <path>}` (absolute, or starting with `~`). `lookup`, `check`, `save`, `update`,
+  `validate`, and `export` use that file. `save` and `update` write it and do not commit it; they commit
+  `registry.yaml` only when it changed.
+- `bin/causal_store.py link --model ID --path P`: validates the model in P, sets `model_paths[ID] = P`, adds the model
+  to its domain, removes the store copy `models/<ID>.yaml` when it exists, and commits `link <ID>`.
+- A missing external file gives `model not found: <id> (<path>)`; `lookup` skips the model.
+
 ## [0.2.0] - 2026-11-17
 
 ### Added

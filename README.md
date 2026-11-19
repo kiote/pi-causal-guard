@@ -81,6 +81,24 @@ domains:
 
 `causal_model_save` with `keywords` in the model object creates a new domain with these keywords.
 
+### External model files
+
+A model can live in another repository (for example a shared team repository). `model_paths` in `registry.yaml`
+maps a model id to its file; the path is absolute or starts with `~`:
+
+```yaml
+model_paths:
+  checkout-funnel: ~/src/team-models/checkout-funnel.yaml
+```
+
+All subcommands read and write that file. `save` and `update` do not commit it (it belongs to the other
+repository); they commit `registry.yaml` only when it changed. `link` validates an existing file, adds it to
+`model_paths` and to its domain, and removes the store copy:
+
+```
+python bin/causal_store.py link --model checkout-funnel --path ~/src/team-models/checkout-funnel.yaml
+```
+
 ## Model format
 
 Each model is one YAML file `models/<id>.yaml` (schema v2). See `SPEC.md` for the required keys and rules.

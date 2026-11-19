@@ -668,3 +668,153 @@ def test_edge_without_endpoints_has_no_self_edge_error():
     errors = causal_store.validate_model(model)
     assert any(e.startswith("dangling edge e") for e in errors)
     assert not any("to itself" in e for e in errors)
+
+
+# ---------------------------------------------------------------- v0.3.0: external model files
+
+def write_external(tmp_path, model, name="m.yaml"):
+    path = tmp_path / "team-repo" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(model, sort_keys=False), encoding="utf-8")
+    return path
+
+
+def read_registry(store):
+    return yaml.safe_load((store / "registry.yaml").read_text(encoding="utf-8"))
+
+
+def store_snapshot(store):
+    files = {str(p.relative_to(store)): p.read_bytes() for p in sorted(store.rglob("*"))
+             if p.is_file() and ".git" not in p.relative_to(store).parts}
+    return git_state(store), files
+
+
+def last_commit(store):
+    out = subprocess.run(["git", "-C", str(store), "show", "--name-only", "--format=%s", "HEAD"],
+                         capture_output=True, text=True, check=True)
+    return [line for line in out.stdout.splitlines() if line]
+
+
+def test_link_valid_external_model_registers_removes_store_copy_and_commits(cli, store, tmp_path):
+    assert save(cli, make_model([("X", "Y")]))[0] == 0
+    external = write_external(tmp_path, make_model([("X", "Y")], domain="team", revision=4))
+    commits = commit_count(store)
+    code, out = cli("link", "--model", "m", "--path", str(external))
+    assert code == 0, out
+    assert out == {"id": "m", "path": str(external), "revision": 4, "removed_store_copy": True}
+    registry = read_registry(store)
+    assert registry["model_paths"] == {"m": str(external)}
+    assert registry["domains"]["team"]["models"] == ["m"]
+    assert "m" not in registry["domains"]["d"]["models"]
+    assert not (store / "models" / "m.yaml").exists()
+    tracked = subprocess.run(["git", "-C", str(store), "ls-files"], capture_output=True, text=True, check=True)
+    assert tracked.stdout.split() == ["config.yaml", "registry.yaml"]
+    assert commit_count(store) == commits + 1
+    assert last_commit(store) == ["link m", "models/m.yaml", "registry.yaml"]
+    assert git_state(store)[1] == ""
+
+
+def test_link_rejects_bad_input_and_changes_nothing(cli, store, tmp_path):
+    assert save(cli, make_model([("X", "Y")]))[0] == 0
+    before = store_snapshot(store)
+    cyclic = write_external(tmp_path, make_model([("A", "B"), ("B", "A")]), "cyclic.yaml")
+    other_id = write_external(tmp_path, make_model([("X", "Y")], model_id="other"), "other.yaml")
+    valid = write_external(tmp_path, make_model([("X", "Y")]))
+    cases = [
+        (cyclic, "directed cycle"),
+        (other_id, "does not match --model m"),
+        (tmp_path / "team-repo" / "missing.yaml", f"model not found: m ({tmp_path / 'team-repo' / 'missing.yaml'})"),
+        ("team-repo/m.yaml", "must be absolute or start with ~"),
+    ]
+    for path, error in cases:
+        code, out = cli("link", "--model", "m", "--path", str(path))
+        assert code == 2 and any(error in e for e in out["errors"]), (path, out)
+        assert store_snapshot(store) == before, path
+    assert valid.exists()
+
+
+def test_link_path_with_tilde_is_expanded(cli, store, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    external = home / "team" / "m.yaml"
+    external.parent.mkdir(parents=True)
+    external.write_text(yaml.safe_dump(make_model([("X", "Y")])), encoding="utf-8")
+    code, out = cli("link", "--model", "m", "--path", "~/team/m.yaml")
+    assert code == 0 and out["path"] == "~/team/m.yaml" and out["removed_store_copy"] is False, out
+    assert read_registry(store)["model_paths"] == {"m": "~/team/m.yaml"}
+    code, out = cli("save", "--model", "m", stdin=make_model([("X", "Y")]))
+    assert code == 0 and out["path"] == str(external) and out["revision"] == 2, out
+
+
+def link_external(cli, store, tmp_path, **extra):
+    """Store with domain team (keyword widget) and model m linked to an external file in domain team."""
+    other = make_model([("X", "Y")], model_id="other", domain="team")
+    assert cli("save", "--model", "other", stdin={**other, "keywords": ["widget"]})[0] == 0
+    external = write_external(tmp_path, make_model([("X", "Y"), ("Z", "X"), ("Z", "Y")], domain="team", **extra))
+    code, out = cli("link", "--model", "m", "--path", str(external))
+    assert code == 0, out
+    return external
+
+
+def test_linked_model_read_commands_use_external_file(cli, store, tmp_path):
+    external = link_external(cli, store, tmp_path, revision=7)
+    before = git_state(store)
+    code, out = cli("validate", "--model", "m")
+    assert code == 0 and out == {"ok": True, "errors": []}
+    code, out = cli("check", "--model", "m", stdin={"claims": [make_claim("X", "Y", [["X", "Y"]], conditioned_on=["Z"])]})
+    assert code == 0 and out["revision"] == 7 and out["results"][0]["verdict"] == "follows", out
+    code, out = cli("export", "--model", "m", "--format", "dagitty")
+    assert code == 0 and out["revision"] == 7 and out["text"] == "dag {\nX\nY\nZ\nX -> Y\nZ -> X\nZ -> Y\n}", out
+    code, out = lookup(cli, tmp_path, "Why does the widget fail?")
+    assert code == 0 and out["domain"] == "team", out
+    assert [(m["id"], m["path"], m["revision"]) for m in out["models"]] == [
+        ("other", str(store / "models" / "other.yaml"), 1), ("m", str(external), 7)]
+    assert git_state(store) == (before[0], "?? checks.jsonl\n")
+
+
+def test_linked_model_save_and_update_write_external_file_without_store_commit(cli, store, tmp_path):
+    external = link_external(cli, store, tmp_path)
+    head, status = git_state(store)
+    code, out = cli("save", "--model", "m", stdin=make_model([("X", "Y")], domain="team"))
+    assert code == 0 and out == {"id": "m", "revision": 2, "path": str(external), "created": False}, out
+    assert yaml.safe_load(external.read_text(encoding="utf-8"))["revision"] == 2
+    assert git_state(store) == (head, status) and status == ""
+    assert not (store / "models" / "m.yaml").exists()
+
+    code, out = cli("update", "--model", "m", stdin={"facts": [{"text": "seen again", "source": "s1"}]})
+    assert code == 0 and out["revision"] == 3, out
+    saved = yaml.safe_load(external.read_text(encoding="utf-8"))
+    assert saved["revision"] == 3 and str(saved["last_gathered"]) == dt.date.today().isoformat()
+    assert git_state(store) == (head, "?? log.jsonl\n")
+    log = [json.loads(line) for line in (store / "log.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert log[-1]["model"] == "m" and log[-1]["revision"] == 3
+
+    # A save that moves the model to another domain changes the registry: one commit with registry.yaml only.
+    commits = commit_count(store)
+    code, out = cli("save", "--model", "m", stdin=make_model([("X", "Y")], domain="moved"))
+    assert code == 0 and out["revision"] == 4, out
+    assert commit_count(store) == commits + 1
+    assert last_commit(store) == ["save m r4", "registry.yaml"]
+    assert read_registry(store)["domains"]["moved"]["models"] == ["m"]
+    assert git_state(store)[1] == "?? log.jsonl\n"
+
+
+def test_missing_external_file_is_not_found_for_check_and_skipped_by_lookup(cli, store, tmp_path):
+    external = link_external(cli, store, tmp_path)
+    external.unlink()
+    code, out = cli("check", "--model", "m", stdin={"claims": [make_claim("X", "Y", [["X", "Y"]])]})
+    assert code == 2 and out["errors"] == [f"model not found: m ({external})"], out
+    code, out = lookup(cli, tmp_path, "Why does the widget fail?")
+    assert code == 0 and [m["id"] for m in out["models"]] == ["other"], out
+
+
+def test_relative_model_path_in_registry_is_validation_error(cli, store, tmp_path):
+    link_external(cli, store, tmp_path)
+    registry = read_registry(store)
+    registry["model_paths"]["m"] = "team-repo/m.yaml"
+    (store / "registry.yaml").write_text(yaml.safe_dump(registry), encoding="utf-8")
+    code, out = cli("validate", "--model", "m")
+    assert code == 2 and out["ok"] is False and "must be absolute or start with ~" in out["errors"][0], out
+    code, out = cli("export", "--model", "m", "--format", "dot")
+    assert code == 2 and "must be absolute or start with ~" in out["errors"][0], out

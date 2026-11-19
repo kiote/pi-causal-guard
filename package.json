@@ -1,6 +1,6 @@
 {
   "name": "pi-causal-guard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pi package: on each question, find the domain, gather repository and session context, use or create a causal model, check causal claims, and record model updates.",
   "license": "MIT",
   "private": false,

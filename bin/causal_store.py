@@ -6,8 +6,9 @@ Exit codes: 0 success, 2 validation error (bad input or invalid model), 1 other 
 
 Store root: env PI_CAUSAL_STORE, default ~/.pi/agent/causal-models (own git repo).
 Layout: config.yaml, registry.yaml, models/<id>.yaml, checks.jsonl, log.jsonl.
+A model id in registry model_paths has its model file at that path instead (an external file, not committed).
 
-Subcommands: lookup, check, save, update, validate, export, has-check.
+Subcommands: lookup, check, save, update, validate, export, has-check, link.
 """
 import argparse
 import datetime as dt
@@ -160,7 +161,33 @@ def save_registry(root, registry):
 
 
 def model_path(root, model_id):
+    """Store file of a model: models/<id>.yaml."""
     return root / "models" / f"{model_id}.yaml"
+
+
+def expand_external_path(model_id, value):
+    """Path of an external model file; it must be absolute or start with ~ (expanded)."""
+    error = f"model path of {model_id} must be absolute or start with ~: {value!r}"
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(error)
+    try:
+        path = Path(value).expanduser() if value.startswith("~") else Path(value)
+    except RuntimeError as exc:
+        raise ValidationError(f"{error} ({exc})") from exc
+    if not path.is_absolute():
+        raise ValidationError(error)
+    return path
+
+
+def model_file(root, model_id, registry=None):
+    """Return (path, external): the registry model_paths entry of model_id, else models/<id>.yaml."""
+    registry = load_registry(root) if registry is None else registry
+    model_paths = registry.get("model_paths") or {}
+    if not isinstance(model_paths, dict):
+        raise ValidationError("registry model_paths must be a mapping {model id: path}")
+    if model_id in model_paths:
+        return expand_external_path(model_id, model_paths[model_id]), True
+    return model_path(root, model_id), False
 
 
 def require_slug(value, what):
@@ -170,9 +197,9 @@ def require_slug(value, what):
 
 def load_model(root, model_id):
     require_slug(model_id, "model id")
-    path = model_path(root, model_id)
+    path, external = model_file(root, model_id)
     if not path.exists():
-        raise ValidationError(f"model not found: {model_id}")
+        raise ValidationError(f"model not found: {model_id} ({path})" if external else f"model not found: {model_id}")
     model = read_yaml(path)
     if not isinstance(model, dict):
         raise ValidationError(f"model {model_id} is not a mapping")
@@ -597,9 +624,15 @@ def repo_grep(repo, ref, terms, paths):
     return hits[:SEARCH_MAX_HITS], None
 
 
-def model_summary(root, model_id, stale_days):
-    path = model_path(root, model_id)
-    if not SLUG_RE.match(model_id) or not path.exists():
+def model_summary(root, registry, model_id, stale_days):
+    """Lookup entry of a model; None when its file is missing or its model_paths entry is invalid."""
+    if not SLUG_RE.match(model_id):
+        return None
+    try:
+        path, _ = model_file(root, model_id, registry)
+    except ValidationError:
+        return None
+    if not path.exists():
         return None
     try:
         model = read_yaml(path) or {}
@@ -625,7 +658,7 @@ def cmd_lookup(root, prompt_file):
     if domain:
         entry = registry["domains"][domain] or {}
         for model_id in entry.get("models") or []:
-            summary = model_summary(root, model_id, int(config.get("stale_days", 7)))
+            summary = model_summary(root, registry, model_id, int(config.get("stale_days", 7)))
             if summary:
                 models.append(summary)
         paths = list(entry.get("search_paths") or paths)
@@ -674,7 +707,8 @@ def cmd_save(root, model_id, data):
         raise ValidationError("keywords must be a list of strings")
     if model.setdefault("id", model_id) != model_id:
         raise ValidationError(f"model id {model['id']!r} does not match --model {model_id}")
-    path = model_path(root, model_id)
+    registry = load_registry(root)
+    path, external = model_file(root, model_id, registry)
     created = not path.exists()
     old_revision = 0 if created else load_model(root, model_id).get("revision", 0)
     model["revision"] = (old_revision if isinstance(old_revision, int) else 0) + 1
@@ -682,10 +716,15 @@ def cmd_save(root, model_id, data):
     if errors:
         raise ValidationError(errors)
     write_yaml(path, model)
-    registry = load_registry(root)
     register_model(registry, model_id, model["domain"], keywords)
-    save_registry(root, registry)
-    git_commit(root, [path, root / "registry.yaml"], f"{'create' if created else 'save'} {model_id} r{model['revision']}")
+    registry_file = root / "registry.yaml"
+    registry_changed = not registry_file.exists() or registry_file.read_text(encoding="utf-8") != dump_yaml(registry)
+    if registry_changed:
+        save_registry(root, registry)
+    # An external model file belongs to another repository: commit only the store files that changed.
+    paths = ([] if external else [path]) + ([root / "registry.yaml"] if registry_changed else [])
+    if paths:
+        git_commit(root, paths, f"{'create' if created else 'save'} {model_id} r{model['revision']}")
     return {"id": model_id, "revision": model["revision"], "path": str(path), "created": created}
 
 
@@ -770,9 +809,10 @@ def cmd_update(root, model_id, data):
     errors = validate_model(model)
     if errors:
         raise ValidationError(errors)
-    path = model_path(root, model_id)
+    path, external = model_file(root, model_id)
     write_yaml(path, model)
-    git_commit(root, [path], f"update {model_id} r{model['revision']}")
+    if not external:
+        git_commit(root, [path], f"update {model_id} r{model['revision']}")
     append_jsonl(root / "log.jsonl", {"ts": now_iso(), "op": "update", "model": model_id,
                                       "revision": model["revision"], "request": data, "diff": diff})
     return {"id": model_id, "revision": model["revision"], "diff": diff}
@@ -850,6 +890,40 @@ def cmd_export(root, model_id, export_format):
     return {"model": model_id, "revision": model["revision"], "format": export_format, "text": text}
 
 
+def cmd_link(root, model_id, path_text):
+    """Map model_id to an external model file in registry model_paths; remove the store copy."""
+    require_slug(model_id, "model id")
+    path = expand_external_path(model_id, path_text)
+    if not path.exists():
+        raise ValidationError(f"model not found: {model_id} ({path})")
+    model = read_yaml(path)
+    if not isinstance(model, dict):
+        raise ValidationError(f"model {model_id} is not a mapping")
+    if model.get("id") != model_id:
+        raise ValidationError(f"model id {model.get('id')!r} does not match --model {model_id}")
+    errors = validate_model(model)
+    if errors:
+        raise ValidationError([f"model {model_id} is invalid: {e}" for e in errors])
+    registry = load_registry(root)
+    model_paths = registry.get("model_paths") or {}
+    if not isinstance(model_paths, dict):
+        raise ValidationError("registry model_paths must be a mapping {model id: path}")
+    model_paths[model_id] = path_text
+    registry["model_paths"] = model_paths
+    register_model(registry, model_id, model["domain"], None)
+    save_registry(root, registry)
+    git(root, "add", "--", "registry.yaml")
+    store_copy = model_path(root, model_id)
+    removed_store_copy = store_copy.exists()
+    if removed_store_copy:
+        git(root, "rm", "-q", "-f", "--ignore-unmatch", "--", str(store_copy))
+        store_copy.unlink(missing_ok=True)
+    # A repeated link with the same path changes no store file: no commit then.
+    if git(root, "diff", "--cached", "--quiet", check=False).returncode != 0:
+        git(root, "commit", "-q", "-m", f"link {model_id}")
+    return {"id": model_id, "path": path_text, "revision": model["revision"], "removed_store_copy": removed_store_copy}
+
+
 def cmd_has_check(root, ids):
     wanted = [i.strip() for i in ids.split(",") if i.strip()]
     known = set()
@@ -894,6 +968,9 @@ def build_parser():
     export.add_argument("--model", required=True)
     export.add_argument("--format", required=True)
     sub.add_parser("has-check").add_argument("--ids", required=True)
+    link = sub.add_parser("link")
+    link.add_argument("--model", required=True)
+    link.add_argument("--path", required=True)
     return parser
 
 
@@ -921,6 +998,8 @@ def run(argv):
             return cmd_has_check(root, args.ids), 0
         if args.command == "export":
             return cmd_export(root, args.model, args.format), 0
+        if args.command == "link":
+            return cmd_link(root, args.model, args.path), 0
     except UsageError as exc:
         return {"error": f"usage: {exc}"}, 1
     except ValidationError as exc:
