@@ -725,6 +725,8 @@ def test_link_rejects_bad_input_and_changes_nothing(cli, store, tmp_path):
         (other_id, "does not match --model m"),
         (tmp_path / "team-repo" / "missing.yaml", f"model not found: m ({tmp_path / 'team-repo' / 'missing.yaml'})"),
         ("team-repo/m.yaml", "must be absolute or start with ~"),
+        (store / "models" / "m.yaml", "must be outside the store"),
+        (tmp_path / "team-repo", "cannot read model file of m"),
     ]
     for path, error in cases:
         code, out = cli("link", "--model", "m", "--path", str(path))
@@ -807,6 +809,11 @@ def test_missing_external_file_is_not_found_for_check_and_skipped_by_lookup(cli,
     assert code == 2 and out["errors"] == [f"model not found: m ({external})"], out
     code, out = lookup(cli, tmp_path, "Why does the widget fail?")
     assert code == 0 and [m["id"] for m in out["models"]] == ["other"], out
+    before = store_snapshot(store)
+    code, out = cli("save", "--model", "m", stdin=make_model([("X", "Y")], domain="team"))
+    assert code == 2 and out["errors"] == [f"model not found: m ({external})"], out
+    assert not external.exists()
+    assert store_snapshot(store) == before
 
 
 def test_relative_model_path_in_registry_is_validation_error(cli, store, tmp_path):
@@ -818,3 +825,34 @@ def test_relative_model_path_in_registry_is_validation_error(cli, store, tmp_pat
     assert code == 2 and out["ok"] is False and "must be absolute or start with ~" in out["errors"][0], out
     code, out = cli("export", "--model", "m", "--format", "dot")
     assert code == 2 and "must be absolute or start with ~" in out["errors"][0], out
+    code, out = lookup(cli, tmp_path, "Why does the widget fail?")
+    assert code == 0 and [m["id"] for m in out["models"]] == ["other"], out
+
+
+def test_link_rejects_store_copy_with_uncommitted_changes(cli, store, tmp_path):
+    assert save(cli, make_model([("X", "Y")]))[0] == 0
+    tracked = store / "models" / "m.yaml"
+    tracked.write_text(tracked.read_text(encoding="utf-8") + "note: edited\n", encoding="utf-8")
+    untracked = store / "models" / "u.yaml"
+    untracked.write_text(yaml.safe_dump(make_model([("X", "Y")], model_id="u")), encoding="utf-8")
+    before = store_snapshot(store)
+    cases = [
+        ("m", write_external(tmp_path, make_model([("X", "Y")]))),
+        ("u", write_external(tmp_path, make_model([("X", "Y")], model_id="u"), "u.yaml")),
+    ]
+    for model_id, external in cases:
+        code, out = cli("link", "--model", model_id, "--path", str(external))
+        assert code == 2 and out["errors"] == [f"store copy models/{model_id}.yaml has uncommitted changes"], out
+        assert store_snapshot(store) == before, model_id
+
+
+def test_repeated_link_with_same_path_makes_no_commit(cli, store, tmp_path):
+    assert save(cli, make_model([("X", "Y")]))[0] == 0
+    external = write_external(tmp_path, make_model([("X", "Y")]))
+    code, out = cli("link", "--model", "m", "--path", str(external))
+    assert code == 0 and out["removed_store_copy"] is True, out
+    before = store_snapshot(store)
+    code, out = cli("link", "--model", "m", "--path", str(external))
+    assert code == 0, out
+    assert out == {"id": "m", "path": str(external), "revision": 1, "removed_store_copy": False}
+    assert store_snapshot(store) == before and before[0][1] == ""

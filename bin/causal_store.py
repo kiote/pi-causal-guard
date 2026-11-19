@@ -709,6 +709,8 @@ def cmd_save(root, model_id, data):
         raise ValidationError(f"model id {model['id']!r} does not match --model {model_id}")
     registry = load_registry(root)
     path, external = model_file(root, model_id, registry)
+    if external and not path.exists():
+        raise ValidationError(f"model not found: {model_id} ({path})")
     created = not path.exists()
     old_revision = 0 if created else load_model(root, model_id).get("revision", 0)
     model["revision"] = (old_revision if isinstance(old_revision, int) else 0) + 1
@@ -894,9 +896,18 @@ def cmd_link(root, model_id, path_text):
     """Map model_id to an external model file in registry model_paths; remove the store copy."""
     require_slug(model_id, "model id")
     path = expand_external_path(model_id, path_text)
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        pass
+    else:
+        raise ValidationError(f"model path of {model_id} must be outside the store: {path_text!r}")
     if not path.exists():
         raise ValidationError(f"model not found: {model_id} ({path})")
-    model = read_yaml(path)
+    try:
+        model = read_yaml(path)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValidationError(f"cannot read model file of {model_id} as UTF-8 text: {path} ({exc})") from exc
     if not isinstance(model, dict):
         raise ValidationError(f"model {model_id} is not a mapping")
     if model.get("id") != model_id:
@@ -904,6 +915,10 @@ def cmd_link(root, model_id, path_text):
     errors = validate_model(model)
     if errors:
         raise ValidationError([f"model {model_id} is invalid: {e}" for e in errors])
+    store_copy = model_path(root, model_id)
+    store_copy_name = f"models/{model_id}.yaml"
+    if store_copy.exists() and git(root, "status", "--porcelain", "--", store_copy_name).stdout.strip():
+        raise ValidationError(f"store copy {store_copy_name} has uncommitted changes")
     registry = load_registry(root)
     model_paths = registry.get("model_paths") or {}
     if not isinstance(model_paths, dict):
@@ -913,10 +928,9 @@ def cmd_link(root, model_id, path_text):
     register_model(registry, model_id, model["domain"], None)
     save_registry(root, registry)
     git(root, "add", "--", "registry.yaml")
-    store_copy = model_path(root, model_id)
     removed_store_copy = store_copy.exists()
     if removed_store_copy:
-        git(root, "rm", "-q", "-f", "--ignore-unmatch", "--", str(store_copy))
+        git(root, "rm", "-q", "--ignore-unmatch", "--", store_copy_name)
         store_copy.unlink(missing_ok=True)
     # A repeated link with the same path changes no store file: no commit then.
     if git(root, "diff", "--cached", "--quiet", check=False).returncode != 0:
