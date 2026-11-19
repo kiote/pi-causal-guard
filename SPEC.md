@@ -69,8 +69,13 @@ store still checks, updates, and exports it.
 - `link --model ID --path P` → reads P and validates the model (schema v2, and `id` equals ID). It sets
   `model_paths[ID] = P` (the path as given), adds the model to its domain, removes `models/<ID>.yaml` from the store
   (`git rm`) when it exists, and commits (`link <ID>`). Output `{id, path, revision, removed_store_copy}`.
-  An invalid model, an id mismatch, a missing file, or a path that is not absolute gives exit 2 and changes
-  nothing.
+  An invalid model, an id mismatch, a missing file, a file that cannot be read as UTF-8 text, a path that is not
+  absolute, a path inside the store, or a store copy with uncommitted changes (untracked or modified) gives exit 2
+  and changes nothing. A repeated `link` with the same path that changes no store file makes no commit and exits 0
+  (`removed_store_copy: false`).
+- `save` of a linked id whose external file is missing gives `model not found: <id> (<path>)` (exit 2) and creates
+  no file.
+- `lookup` also skips a model whose `model_paths` entry is invalid (for example a relative path).
 - Not in v0.3.0: `unlink`, a tool in the extension for `link`, and relative paths.
 
 ### Config
